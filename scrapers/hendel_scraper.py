@@ -23,6 +23,8 @@ HEADERS = {
 }
 DELAY = 0.8
 VAT_RATE = 20.0
+PAGE_SIZE = 250
+MAX_PAGES = 200
 
 
 def exc_vat(price):
@@ -109,22 +111,36 @@ def full_size_url(src):
     return url
 
 
-def fetch_all_products(session, base_url):
+def fetch_all_products(session, base_url, stop_after=0):
     products = []
-    page = 1
-    while True:
-        url = f"{base_url}/products.json?limit=250&page={page}"
+    seen = set()
+    for page in range(1, MAX_PAGES + 1):
+        url = f"{base_url}/products.json?limit={PAGE_SIZE}&page={page}"
         log(f"Fetching product feed page {page}")
         r = session.get(url, headers=HEADERS, timeout=30)
         if r.status_code != 200:
             log(f"Feed returned HTTP {r.status_code} on page {page}, stopping")
             break
-        batch = r.json().get("products", [])
-        if not batch:
+        try:
+            batch = r.json().get("products", [])
+        except ValueError:
+            log(f"Feed page {page} was not JSON (Content-Type: {r.headers.get('Content-Type', '')}), stopping")
             break
-        products.extend(batch)
-        page += 1
+        new = [p for p in batch if p.get("id") not in seen]
+        if not new:
+            if batch:
+                log(f"Feed page {page} only repeated products already fetched, stopping")
+            break
+        seen.update(p.get("id") for p in new)
+        products.extend(new)
+        if len(batch) < PAGE_SIZE:
+            break
+        if stop_after and len(products) >= stop_after:
+            log(f"Have {len(products)} products, enough for --limit {stop_after}, stopping")
+            break
         time.sleep(DELAY)
+    else:
+        log(f"Reached the {MAX_PAGES} page cap, stopping")
     log(f"Feed complete: {len(products)} products")
     return products
 
@@ -397,19 +413,20 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
     session = requests.Session()
 
+    types = [t.strip().lower() for t in args.types.split(",") if t.strip()]
+    include = [t.strip().lower() for t in args.include.split(",") if t.strip()]
+    exclude = [t.strip().lower() for t in args.exclude.split(",") if t.strip()]
+
     if args.from_json:
         products = json.loads(Path(args.from_json).read_text(encoding="utf-8")).get("products", [])
     else:
-        products = fetch_all_products(session, args.base_url)
+        stop_after = args.limit if not (types or include or exclude) else 0
+        products = fetch_all_products(session, args.base_url, stop_after=stop_after)
         (out_root / "raw_products.json").write_text(json.dumps({"products": products}, indent=1), encoding="utf-8")
 
     if not products:
         log("No products returned. Check the URL in a browser: " + args.base_url + "/products.json")
         sys.exit(1)
-
-    types = [t.strip().lower() for t in args.types.split(",") if t.strip()]
-    include = [t.strip().lower() for t in args.include.split(",") if t.strip()]
-    exclude = [t.strip().lower() for t in args.exclude.split(",") if t.strip()]
 
     selected = []
     for p in products:
