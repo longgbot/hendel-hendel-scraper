@@ -1,0 +1,65 @@
+name: Hendel and Hendel catalogue pull
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Only process the first N products (0 = all)"
+        default: "0"
+      include:
+        description: "Comma separated words the title must contain (blank = all)"
+        default: ""
+      exclude:
+        description: "Comma separated words to skip"
+        default: ""
+      images:
+        description: "Download images"
+        type: boolean
+        default: true
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests openpyxl google-api-python-client google-auth
+
+      - name: Run scraper
+        run: |
+          FLAGS=""
+          if [ "${{ github.event.inputs.limit }}" != "0" ]; then FLAGS="$FLAGS --limit ${{ github.event.inputs.limit }}"; fi
+          if [ -n "${{ github.event.inputs.include }}" ]; then FLAGS="$FLAGS --include '${{ github.event.inputs.include }}'"; fi
+          if [ -n "${{ github.event.inputs.exclude }}" ]; then FLAGS="$FLAGS --exclude '${{ github.event.inputs.exclude }}'"; fi
+          if [ "${{ github.event.inputs.images }}" != "true" ]; then FLAGS="$FLAGS --no-images"; fi
+          eval python scrapers/hendel_scraper.py --out output/hendel $FLAGS
+
+      - name: Upload to Google Drive
+        env:
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          DRIVE_FOLDER_ID: ${{ secrets.HENDEL_DRIVE_FOLDER_ID }}
+        run: python scrapers/drive_upload.py --src output/hendel
+
+      - name: Keep ledger copy in the repo
+        run: |
+          mkdir -p data/hendel
+          cp output/hendel/*.xlsx output/hendel/*.csv output/hendel/raw_products.json data/hendel/
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data/hendel
+          git diff --cached --quiet || git commit -m "Hendel and Hendel catalogue pull $(date -u +%Y-%m-%d)"
+          git push
+
+      - name: Attach ledger to the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: hendel-ledger
+          path: |
+            output/hendel/*.xlsx
+            output/hendel/*.csv
