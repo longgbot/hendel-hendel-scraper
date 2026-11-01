@@ -32,6 +32,8 @@ jobs:
         run: pip install requests openpyxl pillow google-api-python-client google-auth
 
       - name: Run scraper
+        env:
+          HENDEL_IMAGE_BASE_URL: ${{ vars.HENDEL_IMAGE_BASE_URL }}
         run: |
           FLAGS=""
           if [ "${{ github.event.inputs.limit }}" != "0" ]; then FLAGS="$FLAGS --limit ${{ github.event.inputs.limit }}"; fi
@@ -63,3 +65,4 @@ jobs:
           path: |
             output/hendel/*.xlsx
             output/hendel/*.csv
+            output/hendel/WooCommerce upload/*.csv

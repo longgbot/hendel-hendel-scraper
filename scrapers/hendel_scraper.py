@@ -13,9 +13,8 @@ from urllib.parse import urlparse
 
 import requests
 from PIL import Image
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
-from openpyxl.utils import get_column_letter
+
+import woo_export
 
 BASE_URL = "https://hendelandhendel.co.uk"
 HEADERS = {
@@ -28,6 +27,12 @@ VAT_RATE = 20.0
 PAGE_SIZE = 250
 MAX_PAGES = 200
 JPEG_QUALITY = 92
+INCLUDED_TYPES = {
+    "cabinet knobs", "cabinet pull handles", "cabinet handle backplates", "appliance pull handles",
+    "cup handles", "drop handles", "catches and latches",
+}
+IRONMONGERY_TYPES = {"catches and latches"}
+IRONMONGERY = woo_export.IRONMONGERY
 
 
 def exc_vat(price):
@@ -97,6 +102,34 @@ def find_finishes(desc_text):
 def collection_name(title):
     m = re.match(r"^\s*([A-Z][A-Za-z'’]+)\b", title or "")
     return m.group(1) if m else ""
+
+
+def product_category(product):
+    """Hendel's product type, or one worked out from the title when the store leaves it blank."""
+    product_type = (product.get("product_type") or "").strip()
+    if product_type:
+        return product_type
+    title = (product.get("title") or "").lower()
+    option_names = [o.get("name") for o in product.get("options", [])]
+    if "backplate" in title:
+        return "Cabinet Handle Backplates"
+    if "appliance" in title:
+        return "Appliance Pull Handles"
+    if "cup handle" in title:
+        return "Cup Handles"
+    if "drop handle" in title:
+        return "Drop Handles"
+    if "knob" in title:
+        return "Cabinet Knobs"
+    if "catch" in title or "latch" in title:
+        return "Catches and Latches"
+    if "handle" in title or "Hole Centres" in option_names:
+        return "Cabinet Pull Handles"
+    return ""
+
+
+def is_wanted(product):
+    return product_category(product).lower() in INCLUDED_TYPES
 
 
 def image_filename(src, position):
@@ -221,11 +254,17 @@ def price_range(variants):
     return f"{min(prices):.2f}", f"{max(prices):.2f}"
 
 
-def process_product(session, base_url, product, out_root, fetch_pages, download_images):
+def process_product(session, base_url, product, out_root, fetch_pages, download_images, collection_tags):
     title = html.unescape(product.get("title", ""))
     handle = product.get("handle", "")
-    collection = collection_name(title)
-    folder_name = safe_name(title)
+    category = product_category(product)
+    if category.lower() in IRONMONGERY_TYPES:
+        collection = IRONMONGERY
+        folder_name = f"{IRONMONGERY}/{safe_name(title)}"
+        category = f"{IRONMONGERY} > {category}"
+    else:
+        collection = woo_export.collection_for(collection_name(title), collection_tags)
+        folder_name = safe_name(title)
     folder = out_root / "Products" / folder_name
     images_dir = folder / "images"
     folder.mkdir(parents=True, exist_ok=True)
@@ -295,7 +334,7 @@ def process_product(session, base_url, product, out_root, fetch_pages, download_
         "title": title,
         "handle": handle,
         "collection": collection,
-        "product_type": product.get("product_type") or "",
+        "product_type": category,
         "vendor": product.get("vendor") or "",
         "tags": ", ".join(product.get("tags", [])) if isinstance(product.get("tags"), list) else (product.get("tags") or ""),
         "options": ", ".join(option_names),
@@ -344,53 +383,27 @@ def process_product(session, base_url, product, out_root, fetch_pages, download_
             w.writeheader()
             w.writerows(variant_rows)
 
-    return product_row, variant_rows, image_rows, folder_name
+    woo_item = {
+        "title": title,
+        "handle": handle,
+        "collection": collection,
+        "product_type": category,
+        "tags": product.get("tags", []) if isinstance(product.get("tags"), list) else [],
+        "description_html": desc_html,
+        "option_names": option_names,
+        "variants": variants,
+        "images": [{"filename": r["filename"], "variant_ids": r["variant_ids"]} for r in image_rows],
+        "folder": folder_name,
+        "url": url,
+    }
+    return product_row, variant_rows, image_rows, folder_name, woo_item
 
 
-def write_ledger(out_root, product_rows, variant_rows, image_rows):
-    wb = Workbook()
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="1F3A5F")
-
-    def add_sheet(ws, rows, title):
-        ws.title = title
-        if not rows:
-            return
-        keys = []
-        for r in rows:
-            for k in r.keys():
-                if k not in keys:
-                    keys.append(k)
-        ws.append(keys)
-        for c in range(1, len(keys) + 1):
-            cell = ws.cell(row=1, column=c)
-            cell.font = header_font
-            cell.fill = header_fill
-        for r in rows:
-            ws.append([_cell(r.get(k)) for k in keys])
-        for c, k in enumerate(keys, start=1):
-            width = min(60, max(12, max(len(str(r.get(k, ""))) for r in rows[:200]) + 2))
-            ws.column_dimensions[get_column_letter(c)].width = width
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-
-    add_sheet(wb.active, product_rows, "Products")
-    add_sheet(wb.create_sheet(), variant_rows, "Variants")
-    add_sheet(wb.create_sheet(), image_rows, "Images")
-
-    summary = wb.create_sheet("Summary")
-    summary.append(["Generated", datetime.now().strftime("%Y-%m-%d %H:%M")])
-    summary.append(["Source", BASE_URL])
-    summary.append(["VAT rate used for exc VAT columns", f"{VAT_RATE:g}%"])
-    summary.append(["Products", len(product_rows)])
-    summary.append(["Variants", len(variant_rows)])
-    summary.append(["Images", len(image_rows)])
-    summary.append(["Images downloaded", sum(1 for r in image_rows if r["status"] in ("downloaded", "converted to jpg", "existing"))])
-    summary.column_dimensions["A"].width = 22
-    summary.column_dimensions["B"].width = 40
-
-    xlsx_path = out_root / "Hendel and Hendel - Master Ledger.xlsx"
-    wb.save(xlsx_path)
+def write_ledger(out_root, product_rows, variant_rows, image_rows, woo_items, image_base_url, source):
+    images_downloaded = sum(1 for r in image_rows if r["status"] in ("downloaded", "converted to jpg", "existing"))
+    xlsx_path = woo_export.write_outputs(
+        out_root, woo_items, VAT_RATE, image_base_url, len(image_rows), images_downloaded, source,
+    )
 
     for name, rows in (("products", product_rows), ("variants", variant_rows), ("images", image_rows)):
         if not rows:
@@ -428,6 +441,11 @@ def main():
     ap.add_argument("--no-pages", action="store_true", help="Skip fetching product HTML pages (faster, loses Dimensions tab)")
     ap.add_argument("--from-json", default="", help="Use a saved products.json file instead of fetching")
     ap.add_argument("--vat-rate", type=float, default=20.0, help="VAT percentage used to calculate exc VAT prices")
+    ap.add_argument("--all-products", action="store_true", help="Include every product type, not just handles, knobs, backplates and catches")
+    ap.add_argument(
+        "--image-base-url", default=os.environ.get("HENDEL_IMAGE_BASE_URL", ""),
+        help="Web address the Products folder is uploaded to on the website, used for image links in the WooCommerce files",
+    )
     args = ap.parse_args()
 
     global VAT_RATE
@@ -444,7 +462,7 @@ def main():
     if args.from_json:
         products = json.loads(Path(args.from_json).read_text(encoding="utf-8")).get("products", [])
     else:
-        stop_after = args.limit if not (types or include or exclude) else 0
+        stop_after = args.limit if args.all_products and not (types or include or exclude) else 0
         products = fetch_all_products(session, args.base_url, stop_after=stop_after)
         (out_root / "raw_products.json").write_text(json.dumps({"products": products}, indent=1), encoding="utf-8")
 
@@ -452,8 +470,13 @@ def main():
         log("No products returned. Check the URL in a browser: " + args.base_url + "/products.json")
         sys.exit(1)
 
+    collection_tags = {t for p in products for t in (p.get("tags") or []) if isinstance(t, str)}
+    skipped_types = 0
     selected = []
     for p in products:
+        if not args.all_products and not is_wanted(p):
+            skipped_types += 1
+            continue
         t = (p.get("title") or "").lower()
         pt = (p.get("product_type") or "").lower()
         if types and not any(x in pt for x in types):
@@ -465,25 +488,31 @@ def main():
         selected.append(p)
     if args.limit:
         selected = selected[: args.limit]
+    if skipped_types:
+        log(f"Skipping {skipped_types} products that are not handles, knobs, backplates or catches")
     log(f"Processing {len(selected)} of {len(products)} products")
 
-    product_rows, variant_rows, image_rows = [], [], []
+    product_rows, variant_rows, image_rows, woo_items = [], [], [], []
     for i, p in enumerate(selected, start=1):
         log(f"[{i}/{len(selected)}] {p.get('title')}")
         try:
-            pr, vr, ir, folder_name = process_product(
+            pr, vr, ir, folder_name, woo_item = process_product(
                 session, args.base_url, p, out_root,
                 fetch_pages=not args.no_pages, download_images=not args.no_images,
+                collection_tags=collection_tags,
             )
         except Exception as e:
             log(f"  FAILED: {e}")
             continue
         product_rows.append(pr)
         variant_rows.extend(vr)
+        woo_items.append(woo_item)
         for r in ir:
             image_rows.append({"product_folder": folder_name, **r})
 
-    xlsx = write_ledger(out_root, product_rows, variant_rows, image_rows)
+    if not args.image_base_url:
+        log("Image web address not set: WooCommerce files will hold image file paths, not links")
+    xlsx = write_ledger(out_root, product_rows, variant_rows, image_rows, woo_items, args.image_base_url, args.base_url)
     log(f"Done. Ledger: {xlsx}")
     log(f"Products: {len(product_rows)}  Variants: {len(variant_rows)}  Images: {len(image_rows)}")
 
