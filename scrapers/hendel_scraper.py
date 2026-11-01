@@ -7,10 +7,12 @@ import re
 import sys
 import time
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+from PIL import Image
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -25,6 +27,7 @@ DELAY = 0.8
 VAT_RATE = 20.0
 PAGE_SIZE = 250
 MAX_PAGES = 200
+JPEG_QUALITY = 92
 
 
 def exc_vat(price):
@@ -101,6 +104,9 @@ def image_filename(src, position):
     name = os.path.basename(path)
     if not name or "." not in name:
         name = f"image_{position}.jpg"
+    stem, ext = os.path.splitext(name)
+    if ext.lower() not in (".jpg", ".jpeg"):
+        name = stem + ".jpg"
     return name
 
 
@@ -169,20 +175,38 @@ def extract_dimensions_tab(page_html):
     return text[:2000]
 
 
+def to_jpeg(data):
+    img = Image.open(BytesIO(data))
+    if img.format == "JPEG":
+        return data, False
+    img.seek(0)
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        background = Image.new("RGB", img.size, (255, 255, 255))
+        background.paste(img, mask=img.getchannel("A"))
+        img = background
+    else:
+        img = img.convert("RGB")
+    out = BytesIO()
+    img.save(out, "JPEG", quality=JPEG_QUALITY, optimize=True)
+    return out.getvalue(), True
+
+
 def download_image(session, url, dest):
     if dest.exists() and dest.stat().st_size > 0:
         return "existing"
     try:
-        r = session.get(url, headers=HEADERS, timeout=60, stream=True)
+        r = session.get(url, headers=HEADERS, timeout=60)
         if r.status_code != 200:
             return f"http {r.status_code}"
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(65536):
-                f.write(chunk)
+        data, converted = to_jpeg(r.content)
+        dest.write_bytes(data)
         time.sleep(DELAY / 2)
-        return "downloaded"
+        return "converted to jpg" if converted else "downloaded"
     except requests.RequestException as e:
         return f"error {e}"
+    except OSError as e:
+        return f"unreadable image {e}"
 
 
 def price_range(variants):
@@ -286,7 +310,7 @@ def process_product(session, base_url, product, out_root, fetch_pages, download_
         "finishes": find_finishes(desc_text),
         "dimensions": find_dimensions(desc_text) or dimensions_tab[:200],
         "image_count": len(images),
-        "images_downloaded": sum(1 for r in image_rows if r["status"] in ("downloaded", "existing")),
+        "images_downloaded": sum(1 for r in image_rows if r["status"] in ("downloaded", "converted to jpg", "existing")),
         "description_text": desc_text,
         "url": url,
         "published_at": product.get("published_at") or "",
@@ -361,7 +385,7 @@ def write_ledger(out_root, product_rows, variant_rows, image_rows):
     summary.append(["Products", len(product_rows)])
     summary.append(["Variants", len(variant_rows)])
     summary.append(["Images", len(image_rows)])
-    summary.append(["Images downloaded", sum(1 for r in image_rows if r["status"] in ("downloaded", "existing"))])
+    summary.append(["Images downloaded", sum(1 for r in image_rows if r["status"] in ("downloaded", "converted to jpg", "existing"))])
     summary.column_dimensions["A"].width = 22
     summary.column_dimensions["B"].width = 40
 
